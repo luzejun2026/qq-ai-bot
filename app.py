@@ -387,25 +387,25 @@ def on_message(wsa, message):
                     send_reply(t, d, f"上下文已清空（共清除 {n} 条记录），我们从零开始聊吧～")
                     return
                 if t != "C2C_MESSAGE_CREATE":
-                    # 群消息：判断是否点名了机器人。
-                    # QQ 有时不下发 mentions！所以：
-                    #   1) mentions 里 is_you/bot 标志；2) 从历史事件学到的自己的 openid
-                    #      与消息里 @ 标记 id 求交集；3) mentions 里名字匹配
-                    mentions = d.get("mentions") or []
-                    for m in mentions:
-                        if isinstance(m, dict) and (m.get("is_you") or m.get("bot") is True):
-                            for f in ("member_openid", "id", "user_openid"):
-                                if m.get(f):
-                                    MY_OPENIDS.add(m[f])
-                    at_ids = set(re.findall(r"<@[!&]?([0-9A-Fa-f]+)>", raw_content))
-                    mentioned = (
-                        any(isinstance(m, dict) and (m.get("is_you") or m.get("bot") is True)
-                            for m in mentions)
-                        or bool(MY_OPENIDS & at_ids)
-                        or mentions_me(mentions)
-                    )
-                    log("[群消息] at_ids=", list(at_ids), "| mine=", len(MY_OPENIDS),
-                        "| 点名判定:", mentioned)
+                    if t == "GROUP_AT_MESSAGE_CREATE":
+                        # 公域群事件：QQ 只在被 @ 时才推送此类型，事件本身就是点名
+                        mentioned = True
+                    else:
+                        # GROUP_MESSAGE_CREATE（全量事件）：需要判定是否点名
+                        mentions = d.get("mentions") or []
+                        for m in mentions:
+                            if isinstance(m, dict) and (m.get("is_you") or m.get("bot") is True):
+                                for f in ("member_openid", "id", "user_openid"):
+                                    if m.get(f):
+                                        MY_OPENIDS.add(m[f])
+                        at_ids = set(re.findall(r"<@[!&]?([0-9A-Fa-f]+)>", raw_content))
+                        mentioned = (
+                            any(isinstance(m, dict) and (m.get("is_you") or m.get("bot") is True)
+                                for m in mentions)
+                            or bool(MY_OPENIDS & at_ids)
+                            or mentions_me(mentions)
+                        )
+                    log("[群消息]", t, "| 点名判定:", mentioned)
                     if not mentioned:
                         # 没点名：矛头指向/能接上话 AI 自行决定；否则只记上下文
                         if content or img_url:
