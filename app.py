@@ -13,6 +13,7 @@ import json
 import os
 import time
 import re
+import base64
 import secrets
 import subprocess
 import threading
@@ -67,10 +68,32 @@ def get_token():
     return d["access_token"], int(d.get("expires_in", 7000))
 
 
+# ---------- 图片下载（转 base64 data URI 交给多模态模型识别）----------
+def fetch_image_datauri(url):
+    """下载 QQ 图片附件，返回 data URI；失败返回 None。"""
+    token = ""
+    try:
+        token, _ = get_token()
+    except Exception:
+        token = ""
+    headers_try = [{}, {"Authorization": "QQBot " + token}] if token else [{}]
+    for hdrs in headers_try:
+        try:
+            rr = requests.get(url, headers=hdrs, timeout=15)
+            if rr.status_code == 200 and rr.content[:4] in (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xdb", b"\x89PNG"):
+                b64 = base64.b64encode(rr.content).decode()
+                ctype = "image/png" if rr.content[:4] == b"\x89PNG" else "image/jpeg"
+                return f"data:{ctype};base64,{b64}"
+        except Exception:
+            continue
+    return None
+
+
 # ---------- 大模型回复 ----------
-def make_reply(content, openid=""):
+def make_reply(content, openid="", image_datauri=None):
     h = histories.setdefault(openid, [])
-    h.append({"role": "user", "content": content})
+    # 历史里只存文字占位，避免过期图片链接拖累后续对话
+    h.append({"role": "user", "content": content or "[图片]"})
     if len(h) > 20:
         del h[:-20]
     try:
@@ -78,14 +101,20 @@ def make_reply(content, openid=""):
         headers = {"Content-Type": "application/json"}
         if LLM_API_KEY:
             headers["Authorization"] = "Bearer " + LLM_API_KEY
+        # 当前这轮带上图片（多模态）；其余历史保持文字
+        if image_datauri:
+            current = {"role": "user", "content": [
+                {"type": "text", "text": content or "请描述这张图片"},
+                {"type": "image_url", "image_url": {"url": image_datauri}},
+            ]}
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + h[:-1] + [current]
+        else:
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + h
         r = requests.post(
             url,
             headers=headers,
             timeout=60,
-            json={
-                "model": LLM_MODEL,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + h,
-            },
+            json={"model": LLM_MODEL, "messages": msgs},
         )
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
@@ -94,6 +123,8 @@ def make_reply(content, openid=""):
             text = (msg.get("reasoning") or "").strip()[-200:]
     except Exception as e:
         log("[LLM异常]", e)
+        if h and h[-1].get("role") == "user" and (h[-1].get("content") == (content or "[图片]")):
+            h.pop()
         text = "我脑子（大模型服务）刚刚短路了一下，稍后再试试~"
     if text:
         h.append({"role": "assistant", "content": text})
@@ -169,11 +200,26 @@ def on_message(wsa, message):
         elif t == "RESUMED":
             log("[恢复] RESUMED")
         elif t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
-            content = d.get("content", "")
+            content = (d.get("content") or "").strip()
             author = d.get("author", {}).get("user_openid", "?")
+            atts = d.get("attachments") or []
+            img_url = None
+            for a in atts:
+                if a.get("content_type") == "image" and a.get("url"):
+                    img_url = a["url"]
+                    break
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
-                send_reply(t, d, make_reply(content, author))
+                if img_url:
+                    # 图片消息：下载并转 base64 交给多模态模型识别
+                    datauri = fetch_image_datauri(img_url)
+                    if datauri:
+                        send_reply(t, d, make_reply(content, author, image_datauri=datauri))
+                    else:
+                        send_reply(t, d, "图片下载失败了，可能是链接过期，再发一次试试？")
+                elif content:
+                    send_reply(t, d, make_reply(content, author))
+                # 其他空消息（表情/戳一戳等）忽略，不回复
             except Exception as e:
                 log("[回复异常]", e)
         else:
