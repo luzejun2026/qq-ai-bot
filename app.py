@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""QQ 机器人 + 健康检查 + 自唤醒（适用于 Render / Koyeb 等免费容器）
+"""QQ 机器人 + 健康检查 + 自唤醒 + 网页终端（适用于 Render / Koyeb 等免费容器）
 
-- 在后台线程里维持 QQ WebSocket 长连接并调用你自建的 Ollama 回复
-- 主线程监听 $PORT 提供 /healthz 健康检查，满足平台存活探针
-- 若设置了 SELF_URL，每 10 分钟 ping 自己一次，破解免费档"无流量就休眠"
+- 后台线程维持 QQ WebSocket 长连接并调用 LLM 回复
+- 主线程监听 $PORT 提供：
+    /healthz       公开健康检查（保活探针，勿加鉴权）
+    /              网页终端（需登录）
+    /login         提交密码换取会话
+    /exec          执行命令（需登录，30s 超时）
+- 若设置了 SELF_URL，每 10 分钟 ping 自己，破解免费档"无流量就休眠"
 """
 import json
 import os
 import time
+import re
+import secrets
+import subprocess
 import threading
 import requests
 import websocket
@@ -28,6 +35,15 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 # 部署后把本服务的公网地址填进来，例如 https://qqbot.onrender.com
 SELF_URL = os.environ.get("SELF_URL", "").rstrip("/")
+
+# 网页终端密码（务必通过环境变量设置；缺失时启动生成一次并打印到日志）
+WEB_TERM_PASSWORD = os.environ.get("WEB_TERM_PASSWORD", "")
+if not WEB_TERM_PASSWORD:
+    WEB_TERM_PASSWORD = secrets.token_urlsafe(18)
+    print("[终端] 未设置 WEB_TERM_PASSWORD，已随机生成（请到控制台查看日志）", flush=True)
+
+# 内存会话表（重启即失效，符合临时容器特性）
+SESSIONS = set()
 
 SYSTEM_PROMPT = (
     "你是 QQ 机器人，性格友好、幽默、自然。用简体中文回复，"
@@ -209,17 +225,142 @@ def self_ping_loop():
             log("[自唤醒失败]", e)
 
 
-# ---------- 健康检查 HTTP 服务 ----------
+# ---------- 网页终端 ----------
+TERM_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>服务器终端</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f0a;color:#9cff8f;
+    font-family:Menlo,Consolas,monospace;font-size:14px}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #out{flex:1;overflow-y:auto;padding:10px;white-space:pre-wrap;word-break:break-all}
+  #bar{display:flex;border-top:1px solid #1f3b1c;background:#0b0f0a}
+  #prompt{color:#6cff5f;padding:10px 6px 10px 10px;user-select:none}
+  #cmd{flex:1;background:transparent;border:0;outline:0;color:#caffc1;
+    font:inherit;padding:10px 10px 10px 0}
+  #login{position:absolute;inset:0;background:#0b0f0a;display:flex;
+    align-items:center;justify-content:center;flex-direction:column}
+  #login input{background:#0e140d;border:1px solid #2a5a25;color:#caffc1;
+    padding:10px;font:inherit;border-radius:6px;width:260px}
+  #login button{margin-top:10px;padding:8px 20px;background:#1f7a1a;color:#fff;
+    border:0;border-radius:6px;font:inherit;cursor:pointer}
+  .err{color:#ff7b7b}
+</style>
+</head>
+<body>
+<div id="login">
+  <div style="margin-bottom:10px">🔐 输入终端密码</div>
+  <input id="pw" type="password" placeholder="password" autofocus>
+  <button onclick="login()">进入</button>
+  <div id="lerr" class="err" style="margin-top:8px;height:18px"></div>
+</div>
+<div id="wrap" style="display:none">
+  <div id="out"></div>
+  <div id="bar"><span id="prompt">bot@render:~$</span><input id="cmd" autofocus></div>
+</div>
+<script>
+const out=document.getElementById('out');
+const cmd=document.getElementById('cmd');
+const api=(p,body)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});
+function print(t,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent=t;out.appendChild(d);out.scrollTop=out.scrollHeight;}
+async function login(){
+  const pw=document.getElementById('pw').value;
+  const r=await api('/login',{password:pw});
+  if(r.ok){document.getElementById('login').style.display='none';
+    document.getElementById('wrap').style.display='flex';cmd.focus();
+    print('已连接。这是容器内的 shell，当前目录即工作目录。\\n');}
+  else{document.getElementById('lerr').textContent='密码错误';}
+}
+const hist=[];let hi=0;
+async function run(c){
+  if(!c.trim())return;
+  hist.push(c);hi=hist.length;
+  print('bot@render:~$ '+c);
+  try{
+    const r=await api('/exec',{cmd:c});
+    const j=await r.json();
+    if(r.ok)print(j.output||'(无输出)');
+    else print(j.error||'执行失败','err');
+  }catch(e){print('网络错误: '+e,'err');}
+}
+cmd.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){run(cmd.value);cmd.value='';}
+  else if(e.key==='ArrowUp'){if(hi>0){hi--;cmd.value=hist[hi]||'';e.preventDefault();}}
+  else if(e.key==='ArrowDown'){if(hi<hist.length){hi++;cmd.value=hist[hi]||'';}}
+});
+</script>
+</body>
+</html>"""
+
+
+def get_session(handler):
+    ck = handler.headers.get("Cookie", "")
+    m = re.search(r"session=([a-f0-9]{16,})", ck)
+    return bool(m and m.group(1) in SESSIONS)
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if isinstance(body, str):
+            body = body.encode("utf-8", "replace")
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path in ("/", "/healthz", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"ok")
+            if self.path in ("/",) and not get_session(self):
+                self._send(200, TERM_HTML, "text/html; charset=utf-8")
+                return
+            # 健康检查公开（保活探针）
+            self._send(200, "ok")
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send(404, "not found")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            data = {}
+        if self.path == "/login":
+            pw = data.get("password", "")
+            if secrets.compare_digest(pw, WEB_TERM_PASSWORD):
+                tok = secrets.token_hex(24)
+                SESSIONS.add(tok)
+                self._send(200, "ok", extra={"Set-Cookie": f"session={tok}; Path=/; HttpOnly; SameSite=Strict"})
+            else:
+                self._send(401, "unauthorized")
+            return
+        if self.path == "/exec":
+            if not get_session(self):
+                self._send(401, "unauthorized")
+                return
+            cmd = data.get("cmd", "")
+            if not cmd:
+                self._send(200, json.dumps({"output": ""}))
+                return
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, timeout=30,
+                                   text=True, cwd=os.getcwd())
+                out = (r.stdout or "") + (r.stderr or "")
+                if r.returncode != 0 and not out:
+                    out = f"(退出码 {r.returncode})"
+            except subprocess.TimeoutExpired:
+                out = "⏱ 命令超过 30 秒被强制终止"
+            except Exception as e:
+                out = f"执行异常: {e}"
+            self._send(200, json.dumps({"output": out[:50000]}, ensure_ascii=False))
+            return
+        self._send(404, "not found")
 
     def log_message(self, *a):
         pass
@@ -230,7 +371,7 @@ def main():
     threading.Thread(target=bot_main, daemon=True).start()
     threading.Thread(target=self_ping_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"[HTTP] 健康检查监听 0.0.0.0:{PORT}")
+    log(f"[HTTP] 健康检查+网页终端监听 0.0.0.0:{PORT}")
     srv.serve_forever()
 
 
