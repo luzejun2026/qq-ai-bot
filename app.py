@@ -96,14 +96,34 @@ def send_active(group_openid, text):
 
 
 def find_group(name):
-    """按名字找群：精确或互相包含匹配"""
-    name = (name or "").strip().rstrip("群").strip()
+    """按名字找群：清洗掉'这个群/群/中'等修饰后互相包含匹配"""
+    name = re.sub(r"这?个群|那个群|群里?|中", "", (name or "")).strip()
+    name = name.rstrip("群").strip()
     if not name:
         return None
     for gid, gname in KNOWN_GROUPS.items():
         if gname == name or name in gname or gname in name:
             return gid
     return None
+
+
+def mentions_me(mentions):
+    """判定 mentions 数组里是否包含机器人。
+    可确认是它 → True；所有条目都确认不是它 → False；结构未知 → 保守 True（保证被@必回）。"""
+    if not mentions:
+        return False
+    bn = (BOT_NAME or "").replace(" ", "").lower()
+    for m in mentions:
+        if not isinstance(m, dict):
+            return True  # 结构未知，保守视为被点名
+        if m.get("bot") is True:
+            return True
+        un = (m.get("username") or "").replace(" ", "").lower()
+        if un and bn and (bn in un or un in bn):
+            return True
+        if m.get("bot") is not False or not un:
+            return True  # 该条目身份无法确认，保守视为被点名
+    return False  # 所有条目都明确 bot:False 且名字对不上
 
 
 # ---------- 日志 ----------
@@ -358,15 +378,12 @@ def on_message(wsa, message):
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
                 if t != "C2C_MESSAGE_CREATE":
-                    # 群消息：判断是否点名了机器人。
-                    # 群场景的 @ 标记是另一套 openid，不能拿 READY 的 id 直接比对；
-                    # 可靠依据是 mentions 数组：机器人条目带 bot 标志，或名字等于自己
+                    # 群消息：判断是否点名了机器人（mentions 结构未知，宽松判定 + 日志留证）
                     mentions = d.get("mentions") or []
-                    mentioned = any(
-                        m.get("bot") or (BOT_NAME and m.get("username") == BOT_NAME)
-                        for m in mentions
-                    ) or bool(BOT_ID and re.search(rf"<@[!&]?{BOT_ID}>", d.get("content") or ""))
-                    log("[群消息] 点名判定:", mentioned)
+                    mentioned = mentions_me(mentions) or bool(
+                        BOT_ID and re.search(rf"<@[!&]?{BOT_ID}>", d.get("content") or ""))
+                    log("[群消息] mentions=", json.dumps(mentions, ensure_ascii=False)[:300],
+                        "| 点名判定:", mentioned)
                     if not mentioned:
                         # 没点名：矛头指向/能接上话 AI 自行决定；否则只记上下文
                         if content or img_url:
