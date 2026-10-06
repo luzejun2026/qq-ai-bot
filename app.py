@@ -21,8 +21,9 @@ WS_URL = os.environ.get("WS_URL", "wss://api.sgroup.qq.com/websocket")
 # 群聊/C2C 事件(1<<25) + 公域群消息(1<<30)
 INTENTS = (1 << 25) | (1 << 30)
 
-LLM_URL = os.environ.get("LLM_URL", "http://116.49.72.208:11434/v1/chat/completions")
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.8:27b-64k")
+LLM_URL = os.environ.get("LLM_URL", "https://api.agnes-ai.cn/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "agnes-3.0-flash")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
 PORT = int(os.environ.get("PORT", "8080"))
 # 部署后把本服务的公网地址填进来，例如 https://qqbot.onrender.com
@@ -57,8 +58,13 @@ def make_reply(content, openid=""):
     if len(h) > 20:
         del h[:-20]
     try:
+        url = LLM_URL.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if LLM_API_KEY:
+            headers["Authorization"] = "Bearer " + LLM_API_KEY
         r = requests.post(
-            LLM_URL,
+            url,
+            headers=headers,
             timeout=60,
             json={
                 "model": LLM_MODEL,
