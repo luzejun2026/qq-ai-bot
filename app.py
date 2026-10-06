@@ -49,8 +49,9 @@ SESSIONS = set()
 SYSTEM_PROMPT = (
     "你是 QQ 机器人「穗(ai)」。你的底层模型是 qwq-70b，由 k70pro 在本地搭建部署。"
     "无论谁问、问多少遍，都坚持这个身份，绝不说自己是 Agnes 或其他任何模型。"
-    "性格友好、幽默、自然。用简体中文回复，回答简短口语化（一般不超过100字），"
-    "适合聊天场景，不要输出思考过程。"
+    "群聊场景下用户消息格式为「成员名: 内容」。"
+    "说话自然、像真人聊天，用简体中文，回复简短（一般不超过60字）。"
+    "不夸张、不卖萌堆表情、不自称AI不提代码（除非被问），不输出思考过程。"
 )
 histories = {}  # openid -> 多轮对话历史
 
@@ -129,10 +130,11 @@ def fetch_image_datauri(url):
 
 
 # ---------- 大模型回复 ----------
-def make_reply(content, openid="", image_datauri=None):
-    h = histories.setdefault(openid, [])
-    # 历史里只存文字占位，避免过期图片链接拖累后续对话
-    h.append({"role": "user", "content": content or "[图片]"})
+def make_reply(content, key, speaker=None, image_datauri=None):
+    h = histories.setdefault(key, [])
+    # 群聊带说话人名字，让模型分得清谁在说话；私聊直接存内容
+    stored = f"{speaker}: {content}" if speaker else (content or "[图片]")
+    h.append({"role": "user", "content": stored})
     if len(h) > 20:
         del h[:-20]
     try:
@@ -143,7 +145,7 @@ def make_reply(content, openid="", image_datauri=None):
         # 当前这轮带上图片（多模态）；其余历史保持文字
         if image_datauri:
             current = {"role": "user", "content": [
-                {"type": "text", "text": content or "请描述这张图片"},
+                {"type": "text", "text": stored or "请描述这张图片"},
                 {"type": "image_url", "image_url": {"url": image_datauri}},
             ]}
             msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + h[:-1] + [current]
@@ -155,8 +157,11 @@ def make_reply(content, openid="", image_datauri=None):
             timeout=60,
             json={"model": LLM_MODEL, "messages": msgs},
         )
-        if r.status_code == 429:  # 免费档限流：等几秒重试一次
-            time.sleep(5)
+        # 免费档限流：最多重试两次（5s / 8s）
+        for wait in (5, 8):
+            if r.status_code != 429:
+                break
+            time.sleep(wait)
             r = requests.post(
                 url,
                 headers=headers,
@@ -170,7 +175,7 @@ def make_reply(content, openid="", image_datauri=None):
             text = (msg.get("reasoning") or "").strip()[-200:]
     except Exception as e:
         log("[LLM异常]", e)
-        if h and h[-1].get("role") == "user" and (h[-1].get("content") == (content or "[图片]")):
+        if h and h[-1].get("role") == "user" and (h[-1].get("content") == stored):
             h.pop()
         if "429" in str(e):
             text = "问我的人太多，我这边被限流啦，等几秒再问我一次～"
@@ -254,29 +259,36 @@ def on_message(wsa, message):
             # 不同事件的作者字段不同：C2C 用 user_openid，群聊用 member_openid/id
             a = d.get("author", {})
             author = a.get("user_openid") or a.get("member_openid") or a.get("id") or "?"
+            if t == "C2C_MESSAGE_CREATE":
+                key, speaker = author, None          # 私聊：按人
+            else:
+                key = d.get("group_openid") or author  # 群聊：按群共享上下文
+                speaker = a.get("username") or author[:8]
+            if a.get("bot"):  # 忽略机器人自己的消息，防止自问自答死循环
+                return
             atts = d.get("attachments") or []
             img_url = None
-            for a in atts:
-                if a.get("content_type") == "image" and a.get("url"):
-                    img_url = a["url"]
+            for at in atts:
+                if at.get("content_type") == "image" and at.get("url"):
+                    img_url = at["url"]
                     break
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
                 # 1) 清空上下文指令：真正从内存抹掉，不经过模型
                 if is_clear_cmd(content):
-                    n = do_clear(author)
-                    log("[清空] 已删除用户", author[:6] + "*** 的", n, "条历史")
+                    n = do_clear(key)
+                    log("[清空] 已删除会话", str(key)[:6] + "*** 的", n, "条历史")
                     send_reply(t, d, f"上下文已清空（共清除 {n} 条记录），我们从零开始聊吧～")
                 # 2) 图片消息：下载并转 base64 交给多模态模型识别
                 elif img_url:
                     datauri = fetch_image_datauri(img_url)
                     if datauri:
-                        send_reply(t, d, make_reply(content, author, image_datauri=datauri))
+                        send_reply(t, d, make_reply(content, key, speaker, image_datauri=datauri))
                     else:
                         send_reply(t, d, "图片下载失败了，可能是链接过期，再发一次试试？")
                 # 3) 普通文字消息
                 elif content:
-                    send_reply(t, d, make_reply(content, author))
+                    send_reply(t, d, make_reply(content, key, speaker))
                 # 其他空消息（表情/戳一戳等）忽略，不回复
             except Exception as e:
                 log("[回复异常]", e)
