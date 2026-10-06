@@ -52,6 +52,27 @@ SYSTEM_PROMPT = (
 )
 histories = {}  # openid -> 多轮对话历史
 
+# 清空上下文的触发词：消息里同时含"动作词"和"对象词"即视为清空指令
+CLEAR_ACT = ("清空", "清除", "清掉", "删掉", "重置", "忘记", "清一清")
+CLEAR_OBJ = ("上下文", "对话", "历史", "记忆", "聊天记录", "上文")
+
+def strip_at(c):
+    """去掉群聊消息开头的 @机器人 前缀，例如 '<@!12345> 你好' -> '你好'"""
+    return re.sub(r"<@[!&]?\d+>\s*", "", c or "").strip()
+
+
+def is_clear_cmd(c):
+    """判断是否要求真正清空上下文"""
+    c = strip_at(c)
+    return any(a in c for a in CLEAR_ACT) and any(o in c for o in CLEAR_OBJ)
+
+
+def do_clear(author):
+    """真正从内存里删除该用户的对话历史"""
+    n = len(histories.pop(author, []) or [])
+    return n
+
+
 # ---------- 日志 ----------
 def log(*args):
     print(" ".join(str(a) for a in args), flush=True)
@@ -210,13 +231,19 @@ def on_message(wsa, message):
                     break
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
-                if img_url:
-                    # 图片消息：下载并转 base64 交给多模态模型识别
+                # 1) 清空上下文指令：真正从内存抹掉，不经过模型
+                if is_clear_cmd(content):
+                    n = do_clear(author)
+                    log("[清空] 已删除用户", author[:6] + "*** 的", n, "条历史")
+                    send_reply(t, d, f"上下文已清空（共清除 {n} 条记录），我们从零开始聊吧～")
+                # 2) 图片消息：下载并转 base64 交给多模态模型识别
+                elif img_url:
                     datauri = fetch_image_datauri(img_url)
                     if datauri:
                         send_reply(t, d, make_reply(content, author, image_datauri=datauri))
                     else:
                         send_reply(t, d, "图片下载失败了，可能是链接过期，再发一次试试？")
+                # 3) 普通文字消息
                 elif content:
                     send_reply(t, d, make_reply(content, author))
                 # 其他空消息（表情/戳一戳等）忽略，不回复
@@ -378,6 +405,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, TERM_HTML, "text/html; charset=utf-8")
         elif self.path in ("/healthz", "/health"):
             self._send(200, "ok")
+        elif self.path == "/memory":
+            # 查看当前会话数与每个会话的消息条数（只显示条数，不显示内容）
+            if not get_session(self):
+                self._send(401, "unauthorized")
+                return
+            detail = {k[:6] + "***": len(v) for k, v in histories.items()}
+            self._send(200, json.dumps({"sessions": len(histories), "detail": detail},
+                                       ensure_ascii=False), "application/json")
+        elif self.path in ("/memory/clear", "/clear"):
+            # 清空所有人的上下文
+            if not get_session(self):
+                self._send(401, "unauthorized")
+                return
+            n = sum(len(v) for v in histories.values())
+            histories.clear()
+            self._send(200, json.dumps({"ok": True, "cleared": n, "sessions": 0},
+                                       ensure_ascii=False), "application/json")
         else:
             self._send(404, "not found")
 
@@ -416,6 +460,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 out = f"执行异常: {e}"
             self._send(200, json.dumps({"output": out[:50000]}, ensure_ascii=False))
+            return
+        if self.path in ("/memory/clear", "/clear"):
+            # 清空所有人的上下文（真正从内存删除）
+            if not get_session(self):
+                self._send(401, "unauthorized")
+                return
+            n = sum(len(v) for v in histories.values())
+            histories.clear()
+            self._send(200, json.dumps({"ok": True, "cleared": n, "sessions": 0},
+                                       ensure_ascii=False), "application/json")
             return
         self._send(404, "not found")
 
