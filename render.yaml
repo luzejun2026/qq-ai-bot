@@ -1,0 +1,21 @@
+# Render Blueprint：在 Render 新建 Blueprint 时指向本仓库即可一键部署
+# 文档：https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: qqbot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: QQ_APP_ID
+        value: "1905311626"
+      - key: QQ_APP_SECRET
+        sync: false   # 部署时在 Render 控制台手动填入你的 AppSecret
+      - key: LLM_URL
+        value: "http://116.49.72.208:11434/v1/chat/completions"
+      - key: LLM_MODEL
+        value: "qwen3.8:27b-64k"
+      - key: SELF_URL
+        sync: false   # 部署完成后填入本服务的公网地址，用于自唤醒
