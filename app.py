@@ -57,6 +57,8 @@ histories = {}  # key -> 多轮对话历史（私聊=人，群聊=群）
 
 # 已知群列表：group_openid -> 用户起的名字（收到群事件时自动登记）
 KNOWN_GROUPS = {}
+# 自己在各群/私聊的 openid 集合（从带 is_you 标志的事件里学习，用于 @ 判定）
+MY_OPENIDS = set()
 
 # 清空上下文的触发词：消息里同时含"动作词"和"对象词"即视为清空指令
 CLEAR_ACT = ("清空", "清除", "清掉", "删掉", "重置", "忘记", "清一清")
@@ -108,22 +110,21 @@ def find_group(name):
 
 
 def mentions_me(mentions):
-    """判定 mentions 数组里是否包含机器人。
-    可确认是它 → True；所有条目都确认不是它 → False；结构未知 → 保守 True（保证被@必回）。"""
+    """mentions 数组判定：is_you/bot 标志/名字匹配 → True；结构未知保守 True。"""
     if not mentions:
         return False
     bn = (BOT_NAME or "").replace(" ", "").lower()
     for m in mentions:
         if not isinstance(m, dict):
-            return True  # 结构未知，保守视为被点名
-        if m.get("bot") is True:
+            return True
+        if m.get("is_you") or m.get("bot") is True:
             return True
         un = (m.get("username") or "").replace(" ", "").lower()
         if un and bn and (bn in un or un in bn):
             return True
         if m.get("bot") is not False or not un:
-            return True  # 该条目身份无法确认，保守视为被点名
-    return False  # 所有条目都明确 bot:False 且名字对不上
+            return True
+    return False
 
 
 # ---------- 日志 ----------
@@ -355,7 +356,8 @@ def on_message(wsa, message):
         elif t == "RESUMED":
             log("[恢复] RESUMED")
         elif t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
-            content = strip_at((d.get("content") or "").strip())
+            raw_content = d.get("content") or ""
+            content = strip_at(raw_content.strip())
             # 不同事件的作者字段不同：C2C 用 user_openid，群聊用 member_openid/id
             a = d.get("author", {})
             author = a.get("user_openid") or a.get("member_openid") or a.get("id") or "?"
@@ -377,12 +379,32 @@ def on_message(wsa, message):
                     break
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
+                # 0) 英文短命令（/clear、clear、reset 等）无需 @，群里裸发也生效
+                if re.fullmatch(r"[/!！.。]*\s*(clear|reset|cls|重开|新对话)",
+                                content.strip().lower()):
+                    n = do_clear(key)
+                    log("[清空] 短命令触发，已删除", n, "条历史")
+                    send_reply(t, d, f"上下文已清空（共清除 {n} 条记录），我们从零开始聊吧～")
+                    return
                 if t != "C2C_MESSAGE_CREATE":
-                    # 群消息：判断是否点名了机器人（mentions 结构未知，宽松判定 + 日志留证）
+                    # 群消息：判断是否点名了机器人。
+                    # QQ 有时不下发 mentions！所以：
+                    #   1) mentions 里 is_you/bot 标志；2) 从历史事件学到的自己的 openid
+                    #      与消息里 @ 标记 id 求交集；3) mentions 里名字匹配
                     mentions = d.get("mentions") or []
-                    mentioned = mentions_me(mentions) or bool(
-                        BOT_ID and re.search(rf"<@[!&]?{BOT_ID}>", d.get("content") or ""))
-                    log("[群消息] mentions=", json.dumps(mentions, ensure_ascii=False)[:300],
+                    for m in mentions:
+                        if isinstance(m, dict) and (m.get("is_you") or m.get("bot") is True):
+                            for f in ("member_openid", "id", "user_openid"):
+                                if m.get(f):
+                                    MY_OPENIDS.add(m[f])
+                    at_ids = set(re.findall(r"<@[!&]?([0-9A-Fa-f]+)>", raw_content))
+                    mentioned = (
+                        any(isinstance(m, dict) and (m.get("is_you") or m.get("bot") is True)
+                            for m in mentions)
+                        or bool(MY_OPENIDS & at_ids)
+                        or mentions_me(mentions)
+                    )
+                    log("[群消息] at_ids=", list(at_ids), "| mine=", len(MY_OPENIDS),
                         "| 点名判定:", mentioned)
                     if not mentioned:
                         # 没点名：矛头指向/能接上话 AI 自行决定；否则只记上下文
