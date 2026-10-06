@@ -53,7 +53,12 @@ SYSTEM_PROMPT = (
     "说话自然、像真人聊天，用简体中文，回复简短（一般不超过60字）。"
     "不夸张、不卖萌堆表情、不自称AI不提代码（除非被问），不输出思考过程。"
 )
-histories = {}  # openid -> 多轮对话历史
+histories = {}  # key -> 多轮对话历史（私聊=人，群聊=群）
+
+# 已知群列表：group_openid -> 用户起的名字（收到群事件时自动登记）
+KNOWN_GROUPS = {}
+# 主动消息用量：group_openid -> [年月, 已发条数]（QQ 限制每群每月 4 条主动消息）
+ACTIVE_SENT = {}
 
 # 清空上下文的触发词：消息里同时含"动作词"和"对象词"即视为清空指令
 CLEAR_ACT = ("清空", "清除", "清掉", "删掉", "重置", "忘记", "清一清")
@@ -70,10 +75,48 @@ def is_clear_cmd(c):
     return any(a in c for a in CLEAR_ACT) and any(o in c for o in CLEAR_OBJ)
 
 
-def do_clear(author):
-    """真正从内存里删除该用户的对话历史"""
-    n = len(histories.pop(author, []) or [])
+def do_clear(key):
+    """真正从内存里删除该会话的对话历史"""
+    n = len(histories.pop(key, []) or [])
     return n
+
+
+# ---------- 跨群主动消息（QQ 限制：每群每月 4 条主动消息）----------
+def send_active(group_openid, text):
+    """不带 msg_id 的主动消息。成功返回 True。"""
+    token, _ = get_token()
+    r = requests.post(
+        f"https://api.sgroup.qq.com/v2/groups/{group_openid}/messages",
+        headers={"Authorization": "QQBot " + token},
+        json={"msg_type": 0, "content": text},
+        timeout=10,
+    )
+    log("[主动消息]", group_openid[:6] + "*** ->", r.status_code, r.text[:100])
+    if r.status_code in (200, 201, 204):
+        ym = time.strftime("%Y-%m")
+        if ACTIVE_SENT.get(group_openid, ["", 0])[0] != ym:
+            ACTIVE_SENT[group_openid] = [ym, 0]
+        ACTIVE_SENT[group_openid][1] += 1
+        return True
+    return False
+
+
+def active_usage(group_openid):
+    ym = time.strftime("%Y-%m")
+    if ACTIVE_SENT.get(group_openid, ["", 0])[0] != ym:
+        return 0
+    return ACTIVE_SENT[group_openid][1]
+
+
+def find_group(name):
+    """按名字找群：精确或互相包含匹配"""
+    name = (name or "").strip().rstrip("群").strip()
+    if not name:
+        return None
+    for gid, gname in KNOWN_GROUPS.items():
+        if gname == name or name in gname or gname in name:
+            return gid
+    return None
 
 
 # ---------- 日志 ----------
@@ -264,6 +307,9 @@ def on_message(wsa, message):
             else:
                 key = d.get("group_openid") or author  # 群聊：按群共享上下文
                 speaker = a.get("username") or author[:8]
+                # 自动登记进过的群
+                if key not in KNOWN_GROUPS:
+                    KNOWN_GROUPS[key] = f"群{len(KNOWN_GROUPS) + 1}"
             if a.get("bot"):  # 忽略机器人自己的消息，防止自问自答死循环
                 return
             atts = d.get("attachments") or []
@@ -279,7 +325,34 @@ def on_message(wsa, message):
                     n = do_clear(key)
                     log("[清空] 已删除会话", str(key)[:6] + "*** 的", n, "条历史")
                     send_reply(t, d, f"上下文已清空（共清除 {n} 条记录），我们从零开始聊吧～")
-                # 2) 图片消息：下载并转 base64 交给多模态模型识别
+                # 2) 给当前群起名（必须在群内说）
+                elif t != "C2C_MESSAGE_CREATE" and re.search(r"这?个群(?:叫|名为|叫做|是)\s*(\S{1,20})", content):
+                    gname = re.search(r"这?个群(?:叫|名为|叫做|是)\s*(\S{1,20})", content).group(1).strip()
+                    KNOWN_GROUPS[key] = gname
+                    send_reply(t, d, f"好，这个群我记成「{gname}」了。之后跟我说「在{gname}说内容」，我就帮你带话过去。")
+                # 3) 查我在哪些群
+                elif any(k in content for k in ("几个群", "哪些群", "群列表")):
+                    if KNOWN_GROUPS:
+                        send_reply(t, d, "我知道 " + str(len(KNOWN_GROUPS)) + " 个群：" + "、".join(KNOWN_GROUPS.values()))
+                    else:
+                        send_reply(t, d, "目前还没有群跟我互动过。在群里 @ 我说句话，我就记住了。")
+                # 4) 跨群带话：「在XX说内容」
+                elif re.search(r"在\s*(.+?)\s*(?:群里?|群)?(?:说|发|讲|喊|带一句)\s*(.+)", content):
+                    m2 = re.search(r"在\s*(.+?)\s*(?:群里?|群)?(?:说|发|讲|喊|带一句)\s*(.+)", content)
+                    target, msg = m2.group(1).strip(), m2.group(2).strip()
+                    gid = find_group(target)
+                    generic = len(target) <= 2 or target in ("这个群", "那个群", "本群", "群里", "群")
+                    if generic:
+                        pass  # 口语里随口提到的"在群里说"，不当作指令
+                    elif not gid:
+                        send_reply(t, d, f"没找到叫「{target}」的群。先在那个群里 @ 我说「记住这个群叫XX」，我才能往那儿带话。")
+                    elif active_usage(gid) >= 4:
+                        send_reply(t, d, "这条没发出去，平台那边卡了一下，晚点再试试吧。")
+                    elif send_active(gid, msg):
+                        send_reply(t, d, f"已帮你在「{KNOWN_GROUPS[gid]}」说了：{msg}")
+                    else:
+                        send_reply(t, d, "这条没发出去，平台那边卡了一下，晚点再试试吧。")
+                # 5) 图片消息：下载并转 base64 交给多模态模型识别
                 elif img_url:
                     datauri = fetch_image_datauri(img_url)
                     if datauri:
