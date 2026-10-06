@@ -15,7 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------- 配置（全部来自环境变量，密钥不写死在代码里）----------
 APP_ID = os.environ.get("QQ_APP_ID", "1905311626")
-APP_SECRET = os.environ.get("QQ_APP_SECRET", "jO3jQ7pXGzjTEzlYL9xmbRH8zrkdXRMH")
+# 注意：密钥只从环境变量读取，绝不写死在代码里（仓库公开也安全）
+APP_SECRET = os.environ.get("QQ_APP_SECRET", "")
 WS_URL = os.environ.get("WS_URL", "wss://api.sgroup.qq.com/websocket")
 # 群聊/C2C 事件(1<<25) + 公域群消息(1<<30)
 INTENTS = (1 << 25) | (1 << 30)
