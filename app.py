@@ -274,6 +274,17 @@ async function login(){
     print('已连接。这是容器内的 shell，当前目录即工作目录。\\n');}
   else{document.getElementById('lerr').textContent='密码错误';}
 }
+// 刷新后若已有会话 cookie，自动恢复终端界面（无需重新登录）
+window.addEventListener('load',async()=>{
+  if(document.cookie.indexOf('session=')>=0){
+    try{
+      const r=await api('/exec',{cmd:''});
+      if(r.ok){document.getElementById('login').style.display='none';
+        document.getElementById('wrap').style.display='flex';cmd.focus();
+        print('已自动恢复会话。\n');}
+    }catch(e){}
+  }
+});
 const hist=[];let hi=0;
 async function run(c){
   if(!c.trim())return;
@@ -315,11 +326,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path in ("/", "/healthz", "/health"):
-            if self.path in ("/",) and not get_session(self):
-                self._send(200, TERM_HTML, "text/html; charset=utf-8")
-                return
-            # 健康检查公开（保活探针）
+        # 首页永远返回终端页（鉴权在 /login、/exec 层做，这里不判断会话）
+        # 健康检查路径才返回 "ok"，供保活探针使用
+        if self.path == "/":
+            self._send(200, TERM_HTML, "text/html; charset=utf-8")
+        elif self.path in ("/healthz", "/health"):
             self._send(200, "ok")
         else:
             self._send(404, "not found")
