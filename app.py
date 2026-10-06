@@ -57,8 +57,6 @@ histories = {}  # key -> 多轮对话历史（私聊=人，群聊=群）
 
 # 已知群列表：group_openid -> 用户起的名字（收到群事件时自动登记）
 KNOWN_GROUPS = {}
-# 主动消息用量：group_openid -> [年月, 已发条数]（QQ 限制每群每月 4 条主动消息）
-ACTIVE_SENT = {}
 
 # 清空上下文的触发词：消息里同时含"动作词"和"对象词"即视为清空指令
 CLEAR_ACT = ("清空", "清除", "清掉", "删掉", "重置", "忘记", "清一清")
@@ -81,9 +79,9 @@ def do_clear(key):
     return n
 
 
-# ---------- 跨群主动消息（QQ 限制：每群每月 4 条主动消息）----------
+# ---------- 跨群主动消息 ----------
 def send_active(group_openid, text):
-    """不带 msg_id 的主动消息。成功返回 True。"""
+    """不带 msg_id 的主动消息。成功返回 True，是否限额由 QQ 平台判定。"""
     token, _ = get_token()
     r = requests.post(
         f"https://api.sgroup.qq.com/v2/groups/{group_openid}/messages",
@@ -92,20 +90,7 @@ def send_active(group_openid, text):
         timeout=10,
     )
     log("[主动消息]", group_openid[:6] + "*** ->", r.status_code, r.text[:100])
-    if r.status_code in (200, 201, 204):
-        ym = time.strftime("%Y-%m")
-        if ACTIVE_SENT.get(group_openid, ["", 0])[0] != ym:
-            ACTIVE_SENT[group_openid] = [ym, 0]
-        ACTIVE_SENT[group_openid][1] += 1
-        return True
-    return False
-
-
-def active_usage(group_openid):
-    ym = time.strftime("%Y-%m")
-    if ACTIVE_SENT.get(group_openid, ["", 0])[0] != ym:
-        return 0
-    return ACTIVE_SENT[group_openid][1]
+    return r.status_code in (200, 201, 204)
 
 
 def find_group(name):
@@ -170,6 +155,50 @@ def fetch_image_datauri(url):
         except Exception:
             continue
     return None
+
+
+# ---------- AI 自己判断"这时该不该接话" ----------
+JUDGE_PROMPT = (
+    "下面是 QQ 群里大家正在聊的内容。你是群里的机器人「穗(ai)」，像普通群友一样参与。"
+    "判断你现在该不该插一句话。\n"
+    "该说：有人点名/求助/提问、话题你能接上且接话自然、你刚被提到。\n"
+    "不该说：大家正常闲聊没理你、插嘴会突兀、内容太短没信息量、你刚才已经说过话了。\n"
+    "只输出一个字母：Y 或 N。"
+)
+
+
+def judge_should_reply(key, content, speaker):
+    """让 AI 决定是否插话，True=该说。"""
+    h = histories.get(key, [])
+    # 你刚说过话就先别抢，避免连刷
+    if h and h[-1].get("role") == "assistant":
+        return False
+    if len((content or "").strip()) < 2:
+        return False
+    msgs = [{"role": "system", "content": JUDGE_PROMPT}] + h[-8:]
+    msgs.append({"role": "user", "content": f"{speaker}: {content}"})
+    try:
+        url = LLM_URL.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if LLM_API_KEY:
+            headers["Authorization"] = "Bearer " + LLM_API_KEY
+        r = requests.post(url, headers=headers, timeout=20,
+                          json={"model": LLM_MODEL, "messages": msgs, "max_tokens": 8})
+        if r.status_code == 429:
+            return False
+        out = (r.json()["choices"][0]["message"].get("content") or "").strip().upper()
+        return out.startswith("Y")
+    except Exception as e:
+        log("[判断异常]", e)
+        return False
+
+
+def record_only(key, speaker, content):
+    """没接话时，也要把群里的聊天记进上下文（含机器人自己说过的话已在 make_reply 里记过）"""
+    h = histories.setdefault(key, [])
+    h.append({"role": "user", "content": f"{speaker}: {content}"})
+    if len(h) > 20:
+        del h[:-20]
 
 
 # ---------- 大模型回复 ----------
@@ -254,6 +283,7 @@ ws = None
 last_heartbeat = 0
 heartbeat_interval = 30
 last_seq = None
+BOT_ID = None  # 从 READY 事件里记录自己的 id，用于判断群消息是否 @ 了自己
 
 
 def heartbeat_loop():
@@ -284,7 +314,7 @@ def on_open(wsa):
 
 
 def on_message(wsa, message):
-    global heartbeat_interval, last_seq
+    global heartbeat_interval, last_seq, BOT_ID
     p = json.loads(message)
     if p.get("s") is not None:
         last_seq = p["s"]
@@ -294,6 +324,7 @@ def on_message(wsa, message):
         log("[Hello] op=10 心跳间隔=", heartbeat_interval, "s")
     elif op == 0:
         if t == "READY":
+            BOT_ID = (d.get("user") or {}).get("id")
             log("[就绪] READY! 用户:", json.dumps(d.get("user", {}), ensure_ascii=False))
         elif t == "RESUMED":
             log("[恢复] RESUMED")
@@ -320,6 +351,18 @@ def on_message(wsa, message):
                     break
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
+                if t != "C2C_MESSAGE_CREATE" and not (
+                    (BOT_ID and f"<@{BOT_ID}>" in (d.get("content") or ""))
+                    or any(m.get("id") == BOT_ID for m in (d.get("mentions") or []))
+                ):
+                    # 群里没点名：让 AI 自己决定要不要接话
+                    if content or img_url:
+                        if judge_should_reply(key, content, speaker):
+                            send_reply(t, d, make_reply(content, key, speaker))
+                        else:
+                            record_only(key, speaker, content or "[图片]")
+                    return
+                # 以下：私聊消息，或群里点名 @ 它的消息
                 # 1) 清空上下文指令：真正从内存抹掉，不经过模型
                 if is_clear_cmd(content):
                     n = do_clear(key)
@@ -346,12 +389,10 @@ def on_message(wsa, message):
                         pass  # 口语里随口提到的"在群里说"，不当作指令
                     elif not gid:
                         send_reply(t, d, f"没找到叫「{target}」的群。先在那个群里 @ 我说「记住这个群叫XX」，我才能往那儿带话。")
-                    elif active_usage(gid) >= 4:
-                        send_reply(t, d, "这条没发出去，平台那边卡了一下，晚点再试试吧。")
                     elif send_active(gid, msg):
                         send_reply(t, d, f"已帮你在「{KNOWN_GROUPS[gid]}」说了：{msg}")
                     else:
-                        send_reply(t, d, "这条没发出去，平台那边卡了一下，晚点再试试吧。")
+                        send_reply(t, d, "这条没发出去，稍后再试一次吧。")
                 # 5) 图片消息：下载并转 base64 交给多模态模型识别
                 elif img_url:
                     datauri = fetch_image_datauri(img_url)
@@ -526,7 +567,11 @@ class Handler(BaseHTTPRequestHandler):
             if not get_session(self):
                 self._send(401, "unauthorized")
                 return
-            detail = {k[:6] + "***": len(v) for k, v in histories.items()}
+            detail = {}
+            for k, v in histories.items():
+                u = sum(1 for m in v if m.get("role") == "user")
+                s = sum(1 for m in v if m.get("role") == "assistant")
+                detail[k[:6] + "***"] = {"用户消息": u, "机器人回复": s}
             self._send(200, json.dumps({"sessions": len(histories), "detail": detail},
                                        ensure_ascii=False), "application/json")
         elif self.path in ("/memory/clear", "/clear"):
