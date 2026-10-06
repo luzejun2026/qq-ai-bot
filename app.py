@@ -47,8 +47,10 @@ if not WEB_TERM_PASSWORD:
 SESSIONS = set()
 
 SYSTEM_PROMPT = (
-    "你是 QQ 机器人，性格友好、幽默、自然。用简体中文回复，"
-    "回答简短口语化（一般不超过100字），适合聊天场景，不要输出思考过程。"
+    "你是 QQ 机器人「穗(ai)」。你的底层模型是 qwq-70b，由 k70pro 在本地搭建部署。"
+    "无论谁问、问多少遍，都坚持这个身份，绝不说自己是 Agnes 或其他任何模型。"
+    "性格友好、幽默、自然。用简体中文回复，回答简短口语化（一般不超过100字），"
+    "适合聊天场景，不要输出思考过程。"
 )
 histories = {}  # openid -> 多轮对话历史
 
@@ -57,8 +59,8 @@ CLEAR_ACT = ("清空", "清除", "清掉", "删掉", "重置", "忘记", "清一
 CLEAR_OBJ = ("上下文", "对话", "历史", "记忆", "聊天记录", "上文")
 
 def strip_at(c):
-    """去掉群聊消息开头的 @机器人 前缀，例如 '<@!12345> 你好' -> '你好'"""
-    return re.sub(r"<@[!&]?\d+>\s*", "", c or "").strip()
+    """去掉消息里的 @机器人 标记（兼容数字/十六进制 id，如 <@0F41A560...>）"""
+    return re.sub(r"<@[^>]*>", "", c or "").strip()
 
 
 def is_clear_cmd(c):
@@ -91,19 +93,35 @@ def get_token():
 
 # ---------- 图片下载（转 base64 data URI 交给多模态模型识别）----------
 def fetch_image_datauri(url):
-    """下载 QQ 图片附件，返回 data URI；失败返回 None。"""
+    """下载 QQ 图片/表情包附件，返回 data URI；失败返回 None。"""
     token = ""
     try:
         token, _ = get_token()
     except Exception:
         token = ""
-    headers_try = [{}, {"Authorization": "QQBot " + token}] if token else [{}]
+    headers_try = [{}, {"Authorization": "QQBot " + token}]
+    if token:
+        headers_try.append({"Authorization": "Bearer " + token})
     for hdrs in headers_try:
         try:
             rr = requests.get(url, headers=hdrs, timeout=15)
-            if rr.status_code == 200 and rr.content[:4] in (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xdb", b"\x89PNG"):
+            head = rr.content[:16]
+            ok = rr.status_code == 200 and (
+                head[:3] == b"\xff\xd8\xff"        # JPEG
+                or head[:4] == b"\x89PNG"          # PNG
+                or head[:3] == b"GIF"              # GIF（表情包常见）
+                or (head[:4] == b"RIFF" and rr.content[8:12] == b"WEBP")  # WEBP
+            )
+            if ok:
                 b64 = base64.b64encode(rr.content).decode()
-                ctype = "image/png" if rr.content[:4] == b"\x89PNG" else "image/jpeg"
+                if head[:4] == b"\x89PNG":
+                    ctype = "image/png"
+                elif head[:3] == b"GIF":
+                    ctype = "image/gif"
+                elif head[:4] == b"RIFF":
+                    ctype = "image/webp"
+                else:
+                    ctype = "image/jpeg"
                 return f"data:{ctype};base64,{b64}"
         except Exception:
             continue
@@ -137,6 +155,14 @@ def make_reply(content, openid="", image_datauri=None):
             timeout=60,
             json={"model": LLM_MODEL, "messages": msgs},
         )
+        if r.status_code == 429:  # 免费档限流：等几秒重试一次
+            time.sleep(5)
+            r = requests.post(
+                url,
+                headers=headers,
+                timeout=60,
+                json={"model": LLM_MODEL, "messages": msgs},
+            )
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
         text = (msg.get("content") or "").strip()
@@ -146,7 +172,10 @@ def make_reply(content, openid="", image_datauri=None):
         log("[LLM异常]", e)
         if h and h[-1].get("role") == "user" and (h[-1].get("content") == (content or "[图片]")):
             h.pop()
-        text = "我脑子（大模型服务）刚刚短路了一下，稍后再试试~"
+        if "429" in str(e):
+            text = "问我的人太多，我这边被限流啦，等几秒再问我一次～"
+        else:
+            text = "我脑子（大模型服务）刚刚短路了一下，稍后再试试~"
     if text:
         h.append({"role": "assistant", "content": text})
         if len(h) > 20:
@@ -158,7 +187,7 @@ def send_reply(event_type, d, text):
     token, _ = get_token()
     if event_type == "C2C_MESSAGE_CREATE":
         url = f"https://api.sgroup.qq.com/v2/users/{d['author']['user_openid']}/messages"
-    elif event_type == "GROUP_AT_MESSAGE_CREATE":
+    elif event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
         url = f"https://api.sgroup.qq.com/v2/groups/{d['group_openid']}/messages"
     else:
         return
@@ -220,9 +249,11 @@ def on_message(wsa, message):
             log("[就绪] READY! 用户:", json.dumps(d.get("user", {}), ensure_ascii=False))
         elif t == "RESUMED":
             log("[恢复] RESUMED")
-        elif t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
-            content = (d.get("content") or "").strip()
-            author = d.get("author", {}).get("user_openid", "?")
+        elif t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
+            content = strip_at((d.get("content") or "").strip())
+            # 不同事件的作者字段不同：C2C 用 user_openid，群聊用 member_openid/id
+            a = d.get("author", {})
+            author = a.get("user_openid") or a.get("member_openid") or a.get("id") or "?"
             atts = d.get("attachments") or []
             img_url = None
             for a in atts:
