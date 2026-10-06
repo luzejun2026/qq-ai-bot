@@ -13,8 +13,9 @@
 |------|------|
 | `QQ_APP_ID` | QQ 机器人 AppID |
 | `QQ_APP_SECRET` | QQ 机器人 AppSecret（**保密**） |
-| `LLM_URL` | Ollama 兼容接口，默认 `http://116.49.72.208:11434/v1/chat/completions` |
-| `LLM_MODEL` | 模型名，默认 `qwen3.8:27b-64k` |
+| `LLM_URL` | OpenAI 兼容接口 base，默认 `https://api.agnes-ai.cn/v1` |
+| `LLM_MODEL` | 模型名，默认 `agnes-3.0-flash` |
+| `LLM_API_KEY` | LLM 接口鉴权 Key（凡需 Bearer 鉴权的接口都要填） |
 | `PORT` | 平台自动注入，健康检查端口 |
 | `SELF_URL` | 部署后填本服务公网地址（如 `https://qqbot.onrender.com`），用于自唤醒 |
 
