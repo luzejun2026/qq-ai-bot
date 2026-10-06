@@ -68,8 +68,10 @@ def strip_at(c):
 
 
 def is_clear_cmd(c):
-    """判断是否要求真正清空上下文"""
-    c = strip_at(c)
+    """判断是否要求真正清空上下文。支持中文短语和 /clear、clear、reset 等命令。"""
+    c = strip_at(c).strip().lower()
+    if re.fullmatch(r"[/!！.。]*\s*(clear|reset|cls|新对话|重开)", c):
+        return True
     return any(a in c for a in CLEAR_ACT) and any(o in c for o in CLEAR_OBJ)
 
 
@@ -159,11 +161,13 @@ def fetch_image_datauri(url):
 
 # ---------- AI 自己判断"这时该不该接话" ----------
 JUDGE_PROMPT = (
-    "下面是 QQ 群里大家正在聊的内容。你是群里的机器人「穗(ai)」，像普通群友一样参与。"
-    "判断你现在该不该插一句话。\n"
-    "该说：有人点名/求助/提问、话题你能接上且接话自然、你刚被提到。\n"
-    "不该说：大家正常闲聊没理你、插嘴会突兀、内容太短没信息量、你刚才已经说过话了。\n"
-    "只输出一个字母：Y 或 N。"
+    "下面是 QQ 群里大家正在聊的内容。你是群里的机器人「穗(ai)」。"
+    "判断你现在该不该对最新这条消息说话，分三档：\n"
+    "1. 必须回：消息点名了你（提到「穗」「ai」「机器人」）、直接向你提问求助、"
+    "话题矛头指向你（评价你、质疑你、找你）、大家在等你回应。\n"
+    "2. 可以回：与你无关的闲聊，但你接话自然、能提供帮助、能活跃气氛。\n"
+    "3. 不要回：纯灌水没信息量、你插嘴很突兀、你刚说过话、与你完全无关且接不上。\n"
+    "第1档一律输出 Y；第2、3档由你判断。只输出一个字母：Y 或 N。"
 )
 
 
@@ -283,7 +287,8 @@ ws = None
 last_heartbeat = 0
 heartbeat_interval = 30
 last_seq = None
-BOT_ID = None  # 从 READY 事件里记录自己的 id，用于判断群消息是否 @ 了自己
+BOT_ID = None    # READY 事件里的用户 id
+BOT_NAME = None  # READY 事件里的名字（群聊 @ 判定用它，群场景 id 是另一套 openid 体系）
 
 
 def heartbeat_loop():
@@ -314,7 +319,7 @@ def on_open(wsa):
 
 
 def on_message(wsa, message):
-    global heartbeat_interval, last_seq, BOT_ID
+    global heartbeat_interval, last_seq, BOT_ID, BOT_NAME
     p = json.loads(message)
     if p.get("s") is not None:
         last_seq = p["s"]
@@ -324,7 +329,8 @@ def on_message(wsa, message):
         log("[Hello] op=10 心跳间隔=", heartbeat_interval, "s")
     elif op == 0:
         if t == "READY":
-            BOT_ID = (d.get("user") or {}).get("id")
+            u = d.get("user") or {}
+            BOT_ID, BOT_NAME = u.get("id"), u.get("username")
             log("[就绪] READY! 用户:", json.dumps(d.get("user", {}), ensure_ascii=False))
         elif t == "RESUMED":
             log("[恢复] RESUMED")
@@ -351,17 +357,24 @@ def on_message(wsa, message):
                     break
             log("[消息] 收到", t, "来自用户", author[:6] + "***（内容不记录）")
             try:
-                if t != "C2C_MESSAGE_CREATE" and not (
-                    (BOT_ID and f"<@{BOT_ID}>" in (d.get("content") or ""))
-                    or any(m.get("id") == BOT_ID for m in (d.get("mentions") or []))
-                ):
-                    # 群里没点名：让 AI 自己决定要不要接话
-                    if content or img_url:
-                        if judge_should_reply(key, content, speaker):
-                            send_reply(t, d, make_reply(content, key, speaker))
-                        else:
-                            record_only(key, speaker, content or "[图片]")
-                    return
+                if t != "C2C_MESSAGE_CREATE":
+                    # 群消息：判断是否点名了机器人。
+                    # 群场景的 @ 标记是另一套 openid，不能拿 READY 的 id 直接比对；
+                    # 可靠依据是 mentions 数组：机器人条目带 bot 标志，或名字等于自己
+                    mentions = d.get("mentions") or []
+                    mentioned = any(
+                        m.get("bot") or (BOT_NAME and m.get("username") == BOT_NAME)
+                        for m in mentions
+                    ) or bool(BOT_ID and re.search(rf"<@[!&]?{BOT_ID}>", d.get("content") or ""))
+                    log("[群消息] 点名判定:", mentioned)
+                    if not mentioned:
+                        # 没点名：矛头指向/能接上话 AI 自行决定；否则只记上下文
+                        if content or img_url:
+                            if judge_should_reply(key, content, speaker):
+                                send_reply(t, d, make_reply(content, key, speaker))
+                            else:
+                                record_only(key, speaker, content or "[图片]")
+                        return
                 # 以下：私聊消息，或群里点名 @ 它的消息
                 # 1) 清空上下文指令：真正从内存抹掉，不经过模型
                 if is_clear_cmd(content):
