@@ -509,6 +509,10 @@ def process_message(t, d):
         log("[回复异常]", e)
 
 
+def on_error(wsa, error):
+    log("[错误]", error)
+
+
 def on_close(wsa, code, reason):
     log("[断开] code=", code, "reason=", reason)
 
