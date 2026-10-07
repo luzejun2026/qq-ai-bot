@@ -335,6 +335,7 @@ def key_lock(k):
 
 
 def heartbeat_loop():
+    global last_heartbeat_sent
     while True:
         time.sleep(heartbeat_interval)
         try:
@@ -368,7 +369,7 @@ def on_open(wsa):
 def on_message(wsa, message):
     """读线程只做解析与分发，绝不在这里做阻塞的 LLM/HTTP 调用，
     保证 WebSocket 读线程永远空闲，能及时回应 QQ 的心跳、不丢消息。"""
-    global heartbeat_interval, last_seq, BOT_ID, BOT_NAME, last_heartbeat_ack
+    global heartbeat_interval, last_seq, BOT_ID, BOT_NAME, last_heartbeat_ack, last_heartbeat_sent
     try:
         p = json.loads(message)
     except Exception:
