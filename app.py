@@ -322,6 +322,8 @@ last_heartbeat_ack = 0             # 最近一次收到 op=11 的时间
 last_heartbeat_sent = 0            # 最近一次成功发出 op=1 心跳的时间（看门狗以此判活）
 BOT_ID = None    # READY 事件里的用户 id
 BOT_NAME = None  # READY 事件里的名字（群聊 @ 判定用它，群场景 id 是另一套 openid 体系）
+session_id = None # READY 返回的会话 id，用于断线 RESUME 续传（补发漏掉的消息）
+conn_epoch = 0   # 每重建一次连接 +1，旧连接的心跳线程据此自行退出，避免多个心跳线程叠加
 EXECUTOR = _cf.ThreadPoolExecutor(max_workers=6, thread_name_prefix="bot-worker")
 MSG_SEQ = {}     # msg_id -> 下一个被动回复要用的 seq（QQ 允许每个 msg_id 最多 5 条被动回复）
 HIST_LOCK = threading.Lock()  # 保护 KNOWN_GROUPS / MSG_SEQ / MY_OPENIDS 等共享结构
@@ -334,9 +336,12 @@ def key_lock(k):
         return KEY_LOCKS.setdefault(k, threading.Lock())
 
 
-def heartbeat_loop():
+def heartbeat_loop(my_epoch):
+    """应用层心跳：每个连接一个线程。连接重建（epoch 变化）后旧线程自行退出，避免叠加。"""
     global last_heartbeat_sent
     while True:
+        if my_epoch != conn_epoch:
+            return  # 旧连接的心跳线程退出
         time.sleep(heartbeat_interval)
         try:
             with ws_lock:
@@ -349,27 +354,32 @@ def heartbeat_loop():
 
 
 def on_open(wsa):
-    global last_heartbeat_sent
+    global last_heartbeat_sent, session_id, conn_epoch
     log("[连接] WebSocket 已建立")
     last_heartbeat_sent = time.time()  # 初始化心跳时间戳，避免看门狗在首跳前误杀
+    conn_epoch += 1
+    my_epoch = conn_epoch
     token, _ = get_token()
-    identify = {
-        "op": 2,
-        "d": {
-            "token": "QQBot " + token,
-            "intents": INTENTS,
-            "shard": [0, 1],
-        },
-    }
-    wsa.send(json.dumps(identify))
-    log("[鉴权] 已发送 Identify (op=2), intents=", INTENTS)
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    if session_id:
+        # 有会话 id：尝试断线续传，网关会把断线期间漏掉的消息补发回来
+        wsa.send(json.dumps({
+            "op": 6,
+            "d": {"token": "QQBot " + token, "session_id": session_id, "seq": last_seq},
+        }))
+        log("[鉴权] 已发送 Resume (op=6), session_id=", (session_id or "")[:8] + "***")
+    else:
+        wsa.send(json.dumps({
+            "op": 2,
+            "d": {"token": "QQBot " + token, "intents": INTENTS, "shard": [0, 1]},
+        }))
+        log("[鉴权] 已发送 Identify (op=2), intents=", INTENTS)
+    threading.Thread(target=heartbeat_loop, args=(my_epoch,), daemon=True).start()
 
 
 def on_message(wsa, message):
     """读线程只做解析与分发，绝不在这里做阻塞的 LLM/HTTP 调用，
     保证 WebSocket 读线程永远空闲，能及时回应 QQ 的心跳、不丢消息。"""
-    global heartbeat_interval, last_seq, BOT_ID, BOT_NAME, last_heartbeat_ack, last_heartbeat_sent
+    global heartbeat_interval, last_seq, BOT_ID, BOT_NAME, last_heartbeat_ack, last_heartbeat_sent, session_id
     try:
         p = json.loads(message)
     except Exception:
@@ -394,6 +404,17 @@ def on_message(wsa, message):
             last_heartbeat_sent = time.time()
         except Exception as e:
             log("[心跳回包失败]", e)
+    elif op == 9:
+        # Invalid Session：会话失效，必须重新 Identify（清空 session_id 后重建连接）
+        if d is False:
+            log("[会话失效] op=9 需要重新鉴权，清空 session_id 并重建连接")
+            session_id = None
+            try:
+                ws.close()
+            except Exception:
+                pass
+        else:
+            log("[会话] op=9 d=", d)
     elif op == 11:
         last_heartbeat_ack = time.time()
         log("[心跳确认] op=11")
@@ -401,9 +422,11 @@ def on_message(wsa, message):
         if t == "READY":
             u = d.get("user") or {}
             BOT_ID, BOT_NAME = u.get("id"), u.get("username")
-            log("[就绪] READY! 用户:", json.dumps(d.get("user", {}), ensure_ascii=False))
+            session_id = d.get("session_id")
+            log("[就绪] READY! 用户:", json.dumps(d.get("user", {}), ensure_ascii=False),
+                " session_id=", (session_id or "")[:8] + "***")
         elif t == "RESUMED":
-            log("[恢复] RESUMED")
+            log("[恢复] RESUMED —— 断线期间的消息已开始补发")
         elif t in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
             a = d.get("author", {})
             if a.get("bot"):
@@ -484,7 +507,7 @@ def process_message(t, d):
         elif t != "C2C_MESSAGE_CREATE" and re.search(r"这?个群(?:叫|名为|叫做|是)\s*(\S{1,20})", content):
             gname = re.search(r"这?个群(?:叫|名为|叫做|是)\s*(\S{1,20})", content).group(1).strip()
             KNOWN_GROUPS[key] = gname
-            send_reply(t, d, f"好，这个群我记成「{gname}」了。之后跟我说「在{gname}说内容」，我就帮你带话过去。")
+            send_reply(t, d, f"好，我把这个群记住了（{gname}）")
         elif any(k in content for k in ("几个群", "哪些群", "群列表")):
             if KNOWN_GROUPS:
                 send_reply(t, d, "我知道 " + str(len(KNOWN_GROUPS)) + " 个群：" + "、".join(KNOWN_GROUPS.values()))
