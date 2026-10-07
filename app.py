@@ -318,7 +318,8 @@ ws = None
 ws_lock = threading.Lock()          # 保护 ws.send，避免多线程并发写同一 socket
 heartbeat_interval = 30
 last_seq = None
-last_heartbeat_ack = 0             # 最近一次收到 op=11 的时间，看门狗据此判断是否需要重连
+last_heartbeat_ack = 0             # 最近一次收到 op=11 的时间
+last_heartbeat_sent = 0            # 最近一次成功发出 op=1 心跳的时间（看门狗以此判活）
 BOT_ID = None    # READY 事件里的用户 id
 BOT_NAME = None  # READY 事件里的名字（群聊 @ 判定用它，群场景 id 是另一套 openid 体系）
 EXECUTOR = _cf.ThreadPoolExecutor(max_workers=6, thread_name_prefix="bot-worker")
@@ -339,6 +340,7 @@ def heartbeat_loop():
         try:
             with ws_lock:
                 ws.send(json.dumps({"op": 1, "d": last_seq}))
+            last_heartbeat_sent = time.time()
             log("[心跳] op=1 已发送, seq=", last_seq)
         except Exception as e:
             log("[心跳失败]", e)
@@ -346,7 +348,9 @@ def heartbeat_loop():
 
 
 def on_open(wsa):
+    global last_heartbeat_sent
     log("[连接] WebSocket 已建立")
+    last_heartbeat_sent = time.time()  # 初始化心跳时间戳，避免看门狗在首跳前误杀
     token, _ = get_token()
     identify = {
         "op": 2,
@@ -386,6 +390,7 @@ def on_message(wsa, message):
         try:
             with ws_lock:
                 ws.send(json.dumps({"op": 1, "d": last_seq}))
+            last_heartbeat_sent = time.time()
         except Exception as e:
             log("[心跳回包失败]", e)
     elif op == 11:
@@ -518,12 +523,13 @@ def on_close(wsa, code, reason):
 
 
 def watchdog():
-    """看门狗：若长时间没收到心跳确认(op=11)，说明连接已假死，强制关闭触发重连。"""
+    """看门狗：若长时间没能成功发出心跳，说明连接已假死，强制关闭触发重连。"""
     while True:
         time.sleep(15)
         try:
-            if ws and (time.time() - last_heartbeat_ack) > (heartbeat_interval * 2 + 20):
-                log("[看门狗] 超过 2 个心跳周期未收到 op=11，强制重连")
+            gap = time.time() - last_heartbeat_sent
+            if ws and last_heartbeat_sent and gap > (heartbeat_interval * 2 + 20):
+                log(f"[看门狗] 已 {gap:.0f}s 未能发出心跳，强制重连")
                 try:
                     ws.close()
                 except Exception:
@@ -546,7 +552,7 @@ def bot_main():
                 on_close=on_close,
             )
             # 关闭库自带的 WS ping（我们用应用层 op=1 心跳），避免两套心跳互相干扰
-            ws.run_forever(ping_interval=0, ping_timeout=0)
+            ws.run_forever()
         except Exception as e:
             log("[异常]", e)
         time.sleep(1)
